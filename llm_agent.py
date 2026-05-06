@@ -1,4 +1,5 @@
 import os
+import time
 import google.generativeai as genai
 from google.generativeai.types import FunctionDeclaration, Tool
 
@@ -161,6 +162,20 @@ def _dispatch(name: str, args: dict, context: dict) -> dict:
     return {"error": f"Невідомий інструмент: {name}"}
 
 
+def _send_with_retry(chat, message, max_retries: int = 3):
+    """Відправляє повідомлення з автоматичним повтором при помилці 429."""
+    for attempt in range(max_retries):
+        try:
+            return chat.send_message(message)
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str and attempt < max_retries - 1:
+                wait = 20 * (attempt + 1)
+                time.sleep(wait)
+                continue
+            raise
+
+
 def run_agent(user_message: str, history: list, context: dict) -> tuple[str, list]:
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -173,20 +188,35 @@ def run_agent(user_message: str, history: list, context: dict) -> tuple[str, lis
     chat = model.start_chat(history=history)
 
     try:
-        response = chat.send_message(user_message)
+        response = _send_with_retry(chat, user_message)
 
-        while response.parts and getattr(response.parts[0], "function_call", None):
-            fc = response.parts[0].function_call
-            tool_result = _dispatch(fc.name, dict(fc.args), context)
+        while True:
+            function_calls = [
+                p.function_call
+                for p in response.parts
+                if hasattr(p, "function_call") and p.function_call.name
+            ]
+            if not function_calls:
+                break
 
-            response = chat.send_message({
-                "function_response": {
-                    "name": fc.name,
-                    "response": tool_result,
+            tool_responses = [
+                {
+                    "function_response": {
+                        "name": fc.name,
+                        "response": _dispatch(fc.name, dict(fc.args), context),
+                    }
                 }
-            })
+                for fc in function_calls
+            ]
+            response = _send_with_retry(chat, tool_responses)
 
-        return response.text, chat.history
+        text_parts = [p.text for p in response.parts if hasattr(p, "text") and p.text]
+        return "\n".join(text_parts) if text_parts else "Не вдалося отримати відповідь.", chat.history
 
     except Exception as e:
-        return f"Помилка API: {e}", history
+        error_str = str(e)
+        if "429" in error_str:
+            return "⏳ Перевищено ліміт запитів. Зачекайте хвилину і спробуйте знову.", history
+        if "API_KEY" in error_str or "403" in error_str:
+            return "🔑 Помилка автентифікації. Перевірте GEMINI_API_KEY у файлі .env.", history
+        return f"❌ Помилка: {error_str}", history
