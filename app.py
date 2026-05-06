@@ -1,6 +1,7 @@
 import os
 import streamlit as st
 from dotenv import load_dotenv
+from google.genai.errors import ClientError
 from llm_agent import run_agent
 
 load_dotenv()
@@ -71,6 +72,25 @@ def init_session():
         st.session_state.query_log = []
     if "pending_prompt" not in st.session_state:
         st.session_state.pending_prompt = None
+
+
+def _classify_error(e: Exception) -> str:
+    if isinstance(e, ClientError):
+        if e.status_code == 429:
+            return "⏳ Перевищено ліміт запитів. Зачекайте хвилину і спробуйте знову."
+        if e.status_code == 503:
+            return "⏳ Сервери Gemini тимчасово перевантажені. Зачекайте 30 секунд і спробуйте ще раз."
+        if e.status_code in (401, 403):
+            return "🔑 Невірний API ключ. Перевірте файл .env"
+        return f"❌ Помилка API {e.status_code}"
+    err = str(e)
+    if "503" in err or "UNAVAILABLE" in err:
+        return "⏳ Сервери Gemini тимчасово перевантажені. Зачекайте 30 секунд і спробуйте ще раз."
+    if "429" in err or "RESOURCE_EXHAUSTED" in err:
+        return "⏳ Перевищено ліміт запитів. Зачекайте хвилину і спробуйте знову."
+    if "401" in err or "403" in err or "API_KEY" in err:
+        return "🔑 Невірний API ключ. Перевірте файл .env"
+    return f"❌ Помилка: {err}"
 
 
 def send_message(prompt: str):

@@ -2,6 +2,7 @@ import os
 import time
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError
 
 from functions import (
     get_recipes_by_ingredients,
@@ -110,13 +111,15 @@ def _dispatch(name: str, args: dict, context: dict) -> dict:
     return {"error": f"Невідомий інструмент: {name}"}
 
 
-def _send_with_retry(chat, message, max_retries: int = 3):
+def _send_with_retry(chat, message, max_retries: int = 4):
     for attempt in range(max_retries):
         try:
             return chat.send_message(message)
         except Exception as e:
-            if "429" in str(e) and attempt < max_retries - 1:
-                time.sleep(20 * (attempt + 1))
+            err = str(e)
+            if ("429" in err or "503" in err) and attempt < max_retries - 1:
+                wait = 15 * (attempt + 1)
+                time.sleep(wait)
                 continue
             raise
 
@@ -129,8 +132,9 @@ def run_agent(user_message: str, history: list, context: dict) -> tuple[str, lis
         tools=[TOOLS],
     )
 
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     chat = client.chats.create(
-        model="gemini-2.5-flash",
+        model=model_name,
         config=config,
         history=history,
     )
@@ -164,10 +168,20 @@ def run_agent(user_message: str, history: list, context: dict) -> tuple[str, lis
         result_text = "\n".join(text_parts) if text_parts else "Не вдалося отримати відповідь."
         return result_text, chat.get_history()
 
+    except ClientError as e:
+        if e.status_code == 429:
+            return "⏳ Перевищено ліміт запитів. Зачекайте хвилину і спробуйте знову.", history
+        if e.status_code == 503:
+            return "⏳ Сервери Gemini тимчасово перевантажені. Зачекайте 30 секунд і спробуйте ще раз.", history
+        if e.status_code in (401, 403):
+            return "🔑 Помилка автентифікації. Перевірте GEMINI_API_KEY у файлі .env.", history
+        return f"❌ Помилка API {e.status_code}: {e}", history
     except Exception as e:
         err = str(e)
-        if "429" in err:
+        if "429" in err or "RESOURCE_EXHAUSTED" in err:
             return "⏳ Перевищено ліміт запитів. Зачекайте хвилину і спробуйте знову.", history
-        if "API_KEY" in err or "403" in err or "401" in err:
+        if "503" in err or "UNAVAILABLE" in err:
+            return "⏳ Сервери Gemini тимчасово перевантажені. Зачекайте 30 секунд і спробуйте ще раз.", history
+        if "API_KEY" in err or "401" in err or "403" in err:
             return "🔑 Помилка автентифікації. Перевірте GEMINI_API_KEY у файлі .env.", history
         return f"❌ Помилка: {err}", history
